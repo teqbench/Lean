@@ -20,6 +20,7 @@ using NUnit.Framework;
 using Python.Runtime;
 using QuantConnect.Algorithm;
 using QuantConnect.Data;
+using QuantConnect.Data.Market;
 using QuantConnect.Interfaces;
 using QuantConnect.Lean.Engine.DataFeeds;
 using QuantConnect.Securities;
@@ -33,32 +34,26 @@ namespace QuantConnect.Tests.Algorithm
     {
         private QCAlgorithm _algorithm;
         private BacktestingOptionChainProvider _optionChainProvider;
+        private BacktestingFutureChainProvider _futureChainProvider;
 
-        [OneTimeSetUp]
-        public void OneTimeSetUp()
+        [SetUp]
+        public void SetUp()
         {
-            var historyProvider = Composer.Instance.GetExportedValueByTypeName<IHistoryProvider>("SubscriptionDataReaderHistoryProvider", true);
-            var parameters = new HistoryProviderInitializeParameters(null, null, TestGlobals.DataProvider, TestGlobals.DataCacheProvider,
-                TestGlobals.MapFileProvider, TestGlobals.FactorFileProvider, (_) => { }, true, new DataPermissionManager(), null,
-                new AlgorithmSettings());
-            try
-            {
-                historyProvider.Initialize(parameters);
-            }
-            catch (InvalidOperationException)
-            {
-               // Already initialized
-            }
-
             _algorithm = new QCAlgorithm();
-            _algorithm.SetHistoryProvider(historyProvider);
+            _algorithm.SetHistoryProvider(TestGlobals.HistoryProvider);
             _algorithm.SubscriptionManager.SetDataManager(new DataManagerStub(_algorithm));
 
-            _optionChainProvider = new BacktestingOptionChainProvider(TestGlobals.DataCacheProvider, TestGlobals.MapFileProvider);
+            var initParameters = new ChainProviderInitializeParameters(TestGlobals.MapFileProvider, TestGlobals.HistoryProvider);
+            _optionChainProvider = new BacktestingOptionChainProvider();
+            _optionChainProvider.Initialize(initParameters);
             _algorithm.SetOptionChainProvider(_optionChainProvider);
+
+            _futureChainProvider = new BacktestingFutureChainProvider();
+            _futureChainProvider.Initialize(initParameters);
+            _algorithm.SetFutureChainProvider(_futureChainProvider);
         }
 
-        private static TestCaseData[] OptionChainTestCases = new TestCaseData[]
+        private static TestCaseData[] OptionChainTestCases => new TestCaseData[]
         {
             // By underlying
             new(Symbols.AAPL, new DateTime(2014, 06, 06, 12, 0, 0)),
@@ -81,81 +76,318 @@ namespace QuantConnect.Tests.Algorithm
             CollectionAssert.AreEquivalent(optionContractsSymbols, optionContractsData.Select(x => x.Symbol));
         }
 
-        [TestCaseSource(nameof(OptionChainTestCases))]
-        public void GetsFullDataOptionChainAsDataFrame(Symbol symbol, DateTime date)
+        private static TestCaseData[] PythonOptionChainTestCases => OptionChainTestCases.SelectMany(x =>
+        {
+            return new object[] { true, false }.Select(y => new TestCaseData(x.OriginalArguments.Concat(new[] { y }).ToArray()));
+        }).ToArray();
+
+        [TestCaseSource(nameof(PythonOptionChainTestCases))]
+        public void GetsFullDataOptionChainAsDataFrame(Symbol symbol, DateTime date, bool flatten)
         {
             _algorithm.SetPandasConverter();
             _algorithm.SetDateTime(date.ConvertToUtc(_algorithm.TimeZone));
 
             using var _ = Py.GIL();
 
-            var module = PyModule.FromString(nameof(GetsFullDataOptionChainAsDataFrame), @"
-def get_option_chain_data_from_dataframe(algorithm, canonical):
-    option_chain_df = algorithm.option_chain(canonical).data_frame
+            using var dataFrame = _algorithm.OptionChain(symbol, flatten).DataFrame;
+            List<Symbol> symbols = null;
 
-    # Will make it more complex than it needs to be,
-    # just so that we can test indexing by symbol using df.loc[]
-    for symbol in option_chain_df.index:
-        symbol_data = option_chain_df.loc[symbol]
+            var expectedOptionContractsSymbols = _optionChainProvider.GetOptionContractList(symbol, date.Date).ToList();
 
-        if symbol_data.shape[0] != 21:
-            raise ValueError(f'Expected 21 row for {symbol}, got {symbol_data.shape[0]}')
-
-        yield {
-            'symbol': symbol,
-            'expiry': symbol_data['expiry'],
-            'strike': symbol_data['strike'],
-            'right': symbol_data['right'],
-            'style': symbol_data['style'],
-            'lastprice': symbol_data['lastprice'],
-            'askprice': symbol_data['askprice'],
-            'bidprice': symbol_data['bidprice'],
-            'openinterest': symbol_data['openinterest'],
-            'impliedvolatility': symbol_data['impliedvolatility'],
-            'delta': symbol_data['delta'],
-            'gamma': symbol_data['gamma'],
-            'vega': symbol_data['vega'],
-            'theta': symbol_data['theta'],
-            'rho': symbol_data['rho'],
-            'underlyingsymbol': symbol_data['underlyingsymbol'],
-            'underlyinglastprice': symbol_data['underlyinglastprice'],
-        }
-");
-
-            using var pyAlgorithm = _algorithm.ToPython();
-            using var pySymbol = symbol.ToPython();
-
-            using var pyOptionChainData = module.GetAttr("get_option_chain_data_from_dataframe").Invoke(pyAlgorithm, pySymbol);
-            var optionChain = new List<Symbol>();
-
-            Assert.DoesNotThrow(() =>
+            if (flatten)
             {
-                foreach (PyObject item in pyOptionChainData.GetIterator())
-                {
-                    var contractSymbol = item["symbol"].GetAndDispose<Symbol>();
-                    optionChain.Add(contractSymbol);
-                    item.DisposeSafely();
-                }
-            });
+                symbols = AssertFlattenedSingleChainDataFrame(dataFrame, symbol, hasCanonicalIndex: false);
+            }
+            else
+            {
+                var dfLength = dataFrame.GetAttr("shape")[0].GetAndDispose<int>();
+                Assert.AreEqual(1, dfLength);
 
-            var optionContractsSymbols = _optionChainProvider.GetOptionContractList(symbol, date.Date).ToList();
+                symbols = AssertUnflattenedSingleChainDataFrame<OptionContract>(dataFrame, symbol);
+            }
 
-            CollectionAssert.AreEquivalent(optionContractsSymbols, optionChain);
+            Assert.IsNotNull(symbols);
+            CollectionAssert.AreEquivalent(expectedOptionContractsSymbols, symbols);
         }
 
         [Test]
-        public void IndexOptionChainApisAreConsistent()
+        public void GetsMultipleFullDataOptionChainAsDataFrame([Values] bool flatten)
         {
-            var date = new DateTime(2015, 12, 24);
+            var date = new DateTime(2015, 12, 24, 12, 0, 0);
+            _algorithm.SetPandasConverter();
             _algorithm.SetDateTime(date.ConvertToUtc(_algorithm.TimeZone));
 
-            var symbol = Symbols.SPX;
-            var exchange = MarketHoursDatabase.FromDataFolder().GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType);
+            using var _ = Py.GIL();
 
+            var symbols = new[] { Symbols.GOOG, Symbols.SPX };
+            using var dataFrame = _algorithm.OptionChains(symbols, flatten).DataFrame;
+
+            var expectedOptionChains = symbols.ToDictionary(x => x, x => _optionChainProvider.GetOptionContractList(x, date).ToList());
+
+            AssertMultiChainsDataFrame<OptionContract>(flatten, symbols, dataFrame, expectedOptionChains, isOptionChain: true);
+        }
+
+        private static List<Symbol> AssertFlattenedSingleChainDataFrame(PyObject dataFrame, Symbol symbol, bool hasCanonicalIndex = true,
+            bool isOptionChain = true)
+        {
+            PyObject subDataFrame = null;
+            try
+            {
+                subDataFrame = GetCanonicalSubDataFrame(dataFrame, symbol, isOptionChain, hasCanonicalIndex, out var canonicalSymbol);
+
+                using var dfColumns = subDataFrame.GetAttr("columns");
+                using var dfColumnsList = dfColumns.InvokeMethod("tolist");
+                using var dfColumnsIterator = dfColumnsList.GetIterator();
+                var columns = new List<string>();
+                foreach (PyObject item in dfColumnsIterator)
+                {
+                    columns.Add(item.ToString());
+                    item.DisposeSafely();
+                }
+
+                var expectedColumns = canonicalSymbol.SecurityType switch
+                {
+                    SecurityType.Future => new[] { "expiry", "volume", "askprice", "asksize", "bidprice", "bidsize", "lastprice", "openinterest" },
+                    SecurityType.FutureOption => new[]
+                    {
+                        "expiry", "strike", "scaledstrike", "right", "style", "volume", "askprice", "asksize", "bidprice", "bidsize",
+                        "lastprice", "underlyingsymbol", "underlyinglastprice"
+                    },
+                    _ => new[]
+                    {
+                        "expiry", "strike", "scaledstrike", "right", "style", "volume", "askprice", "asksize", "bidprice", "bidsize",
+                        "lastprice", "openinterest", "impliedvolatility", "delta", "gamma", "vega", "theta", "rho",
+                        "underlyingsymbol", "underlyinglastprice"
+                    }
+                };
+
+                CollectionAssert.AreEquivalent(expectedColumns, columns);
+                using var dfIndex = subDataFrame.GetAttr("index");
+
+                return dfIndex.InvokeMethod("tolist").GetAndDispose<List<Symbol>>();
+            }
+            finally
+            {
+                if (hasCanonicalIndex)
+                {
+                    subDataFrame?.DisposeSafely();
+                }
+            }
+        }
+
+        private static List<Symbol> AssertUnflattenedSingleChainDataFrame<T>(PyObject dataFrame, Symbol symbol, bool isOptionChain = true)
+            where T : BaseContract
+        {
+            using var subDataFrame = GetCanonicalSubDataFrame(dataFrame, symbol, isOptionChain, true, out _);
+
+            using var dfOptionChainList = subDataFrame["contracts"];
+            var contracts = dfOptionChainList.GetAndDispose<IEnumerable<T>>().ToList();
+
+            return contracts.Select(x => x.Symbol).ToList();
+        }
+
+        private static PyObject GetCanonicalSubDataFrame(PyObject dataFrame, Symbol symbol, bool forOptionChain, bool hasCanonicalIndex,
+            out Symbol canonicalSymbol)
+        {
+            canonicalSymbol = symbol;
+            if (canonicalSymbol.SecurityType == SecurityType.Future && !forOptionChain)
+            {
+                canonicalSymbol = canonicalSymbol.Canonical;
+            }
+            else if (!canonicalSymbol.SecurityType.IsOption())
+            {
+                canonicalSymbol = Symbol.CreateCanonicalOption(symbol);
+            }
+
+            if (!hasCanonicalIndex)
+            {
+                return dataFrame;
+            }
+
+            using var pySymbol = canonicalSymbol.ToPython();
+            return dataFrame.GetAttr("loc")[pySymbol];
+        }
+
+        private static IEnumerable<TestCaseData> GetOptionChainApisTestData()
+        {
+            var indexSymbol = Symbols.SPX;
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 23, 23, 0, 0));
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 24, 0, 0, 0));
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 24, 1, 0, 0));
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 24, 2, 0, 0));
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 24, 6, 0, 0));
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 24, 12, 0, 0));
+            yield return new TestCaseData(indexSymbol, new DateTime(2015, 12, 24, 16, 0, 0));
+
+            var equitySymbol = Symbols.GOOG;
+            yield return new TestCaseData(equitySymbol, new DateTime(2015, 12, 24, 0, 0, 0));
+            yield return new TestCaseData(equitySymbol, new DateTime(2015, 12, 24, 1, 0, 0));
+            yield return new TestCaseData(equitySymbol, new DateTime(2015, 12, 24, 2, 0, 0));
+            yield return new TestCaseData(equitySymbol, new DateTime(2015, 12, 24, 6, 0, 0));
+            yield return new TestCaseData(equitySymbol, new DateTime(2015, 12, 24, 12, 0, 0));
+            yield return new TestCaseData(equitySymbol, new DateTime(2015, 12, 24, 16, 0, 0));
+
+            var futureSymbol = Symbol.CreateFuture(Futures.Indices.SP500EMini, Market.CME, new DateTime(2020, 6, 19));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 04, 23, 0, 0));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 05, 0, 0, 0));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 05, 1, 0, 0));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 05, 2, 0, 0));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 05, 6, 0, 0));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 05, 12, 0, 0));
+            yield return new TestCaseData(futureSymbol, new DateTime(2020, 01, 05, 16, 0, 0));
+        }
+
+        [TestCaseSource(nameof(GetOptionChainApisTestData))]
+        public void OptionChainApisAreConsistent(Symbol symbol, DateTime dateTime)
+        {
+            _algorithm.SetDateTime(dateTime.ConvertToUtc(_algorithm.TimeZone));
+
+            var exchange  = MarketHoursDatabase.FromDataFolder().GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType);
             var chainFromAlgorithmApi = _algorithm.OptionChain(symbol).Select(x => x.Symbol).ToList();
-            var chainFromChainProviderApi = _optionChainProvider.GetOptionContractList(symbol, date.ConvertTo(_algorithm.TimeZone, exchange.TimeZone)).ToList();
+            var chainFromChainProviderApi = _optionChainProvider.GetOptionContractList(symbol,
+                dateTime.ConvertTo(_algorithm.TimeZone, exchange.TimeZone)).ToList();
 
+            CollectionAssert.IsNotEmpty(chainFromAlgorithmApi);
             CollectionAssert.AreEquivalent(chainFromAlgorithmApi, chainFromChainProviderApi);
+        }
+
+        private static IEnumerable<TestCaseData> GetFutureChainApisTestData()
+        {
+            var futureSymbol = Symbol.CreateFuture(Futures.Indices.SP500EMini, Market.CME, new DateTime(2020, 6, 19));
+            var canonicalFutureSymbol = futureSymbol.Canonical;
+            var futureOptionSymbol = Symbol.CreateOption(futureSymbol, futureSymbol.ID.Market, OptionStyle.American, OptionRight.Call,
+                75m, new DateTime(2020, 5, 19));
+
+            foreach (var symbol in new[] { futureSymbol, canonicalFutureSymbol, futureOptionSymbol })
+            {
+                foreach (var withFutureAdded in new[] { true, false })
+                {
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 06, 23, 0, 0), withFutureAdded);
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 07, 0, 0, 0), withFutureAdded);
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 07, 1, 0, 0), withFutureAdded);
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 07, 2, 0, 0), withFutureAdded);
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 07, 6, 0, 0), withFutureAdded);
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 07, 12, 0, 0), withFutureAdded);
+                    yield return new TestCaseData(symbol, new DateTime(2013, 10, 07, 16, 0, 0), withFutureAdded);
+                }
+            }
+        }
+
+        [TestCaseSource(nameof(GetFutureChainApisTestData))]
+        public void FuturesChainApisAreConsistent(Symbol symbol, DateTime dateTime, bool withFutureAdded)
+        {
+            _algorithm.SetDateTime(dateTime.ConvertToUtc(_algorithm.TimeZone));
+
+            if (withFutureAdded)
+            {
+                // It should work regardless of whether the future is added to the algorithm
+                _algorithm.AddFuture("ES");
+            }
+
+            var exchange = MarketHoursDatabase.FromDataFolder().GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType);
+            var chainFromAlgorithmApi = _algorithm.FuturesChain(symbol).Select(x => x.Symbol).ToList();
+            var chainFromChainProviderApi = _futureChainProvider.GetFutureContractList(symbol,
+                dateTime.ConvertTo(_algorithm.TimeZone, exchange.TimeZone)).ToList();
+
+            CollectionAssert.IsNotEmpty(chainFromAlgorithmApi);
+            CollectionAssert.AreEquivalent(chainFromAlgorithmApi, chainFromChainProviderApi);
+        }
+
+        [Test]
+        public void GetsFullDataFuturesChainAsDataFrame([Values] bool flatten, [Values] bool withFutureAdded)
+        {
+            _algorithm.SetPandasConverter();
+            var date = new DateTime(2013, 10, 07);
+            _algorithm.SetDateTime(date.ConvertToUtc(_algorithm.TimeZone));
+
+            using var _ = Py.GIL();
+
+            // It should work regardless of whether the future is added to the algorithm
+            var symbol = withFutureAdded ? _algorithm.AddFuture(Futures.Indices.SP500EMini).Symbol : Symbols.ES_Future_Chain;
+            using var dataFrame = _algorithm.FuturesChain(symbol, flatten).DataFrame;
+            List<Symbol> symbols = null;
+
+            var exchange = MarketHoursDatabase.FromDataFolder().GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType);
+            var exchangeTime = date.ConvertTo(_algorithm.TimeZone, exchange.TimeZone);
+            var expectedFutureContractSymbols = _futureChainProvider.GetFutureContractList(symbol, exchangeTime).ToList();
+
+            if (flatten)
+            {
+                symbols = AssertFlattenedSingleChainDataFrame(dataFrame, symbol, hasCanonicalIndex: false, isOptionChain: false);
+            }
+            else
+            {
+                var dfLength = dataFrame.GetAttr("shape")[0].GetAndDispose<int>();
+                Assert.AreEqual(1, dfLength);
+
+                symbols = AssertUnflattenedSingleChainDataFrame<FuturesContract>(dataFrame, symbol, isOptionChain: false);
+            }
+
+            Assert.IsNotNull(symbols);
+            CollectionAssert.AreEquivalent(expectedFutureContractSymbols, symbols);
+        }
+
+        [Test]
+        public void GetsMultipleFullDataFuturesChainsAsDataFrame([Values] bool flatten, [Values] bool withFutureAdded)
+        {
+            var dateTime = new DateTime(2013, 10, 07, 12, 0, 0);
+            _algorithm.SetPandasConverter();
+            _algorithm.SetDateTime(dateTime.ConvertToUtc(_algorithm.TimeZone));
+
+            using var _ = Py.GIL();
+
+            var symbols = withFutureAdded
+                ? new[] { Symbols.ES_Future_Chain, Symbols.CreateFuturesCanonicalSymbol(Futures.Dairy.ClassIIIMilk) }
+                : new[] { _algorithm.AddFuture(Futures.Indices.SP500EMini).Symbol, _algorithm.AddFuture(Futures.Dairy.ClassIIIMilk).Symbol };
+            using var dataFrame = _algorithm.FuturesChains(symbols, flatten).DataFrame;
+
+            var expectedFuturesChains = symbols.ToDictionary(x => x, x =>
+            {
+                var exchange = MarketHoursDatabase.FromDataFolder().GetExchangeHours(x.ID.Market, x, x.SecurityType);
+                return _futureChainProvider.GetFutureContractList(x, dateTime.ConvertTo(_algorithm.TimeZone, exchange.TimeZone)).ToList();
+            });
+
+            AssertMultiChainsDataFrame<FuturesContract>(flatten, symbols, dataFrame, expectedFuturesChains, isOptionChain: false);
+        }
+
+        private static void AssertMultiChainsDataFrame<T>(bool flatten, Symbol[] symbols, PyObject dataFrame,
+            Dictionary<Symbol, List<Symbol>> expectedChains, bool isOptionChain)
+            where T : BaseContract
+        {
+            var chainsTotalCount = expectedChains.Values.Sum(x => x.Count);
+
+            if (flatten)
+            {
+                var dfLength = dataFrame.GetAttr("shape")[0].GetAndDispose<int>();
+                Assert.AreEqual(chainsTotalCount, dfLength);
+
+                Assert.Multiple(() =>
+                {
+                    foreach (var (symbol, expectedChain) in expectedChains)
+                    {
+                        var chainSymbols = AssertFlattenedSingleChainDataFrame(dataFrame, symbol, isOptionChain: isOptionChain);
+
+                        Assert.IsNotNull(chainSymbols);
+                        CollectionAssert.AreEquivalent(expectedChain, chainSymbols);
+                    }
+                });
+            }
+            else
+            {
+                var dfLength = dataFrame.GetAttr("shape")[0].GetAndDispose<int>();
+                Assert.AreEqual(symbols.Length, dfLength);
+
+                Assert.Multiple(() =>
+                {
+                    foreach (var (symbol, expectedChain) in expectedChains)
+                    {
+                        var chainSymbols = AssertUnflattenedSingleChainDataFrame<T>(dataFrame, symbol, isOptionChain);
+
+                        Assert.IsNotNull(chainSymbols);
+                        CollectionAssert.AreEquivalent(expectedChain, chainSymbols);
+                    }
+                });
+            }
         }
     }
 }

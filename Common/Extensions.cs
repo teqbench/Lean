@@ -191,7 +191,18 @@ namespace QuantConnect
                 return entry;
             }
 
-            return marketHoursDatabase.GetEntry(symbol.ID.Market, symbol, symbol.ID.SecurityType);
+            var result = marketHoursDatabase.GetEntry(symbol.ID.Market, symbol, symbol.ID.SecurityType);
+
+            // For the OptionUniverse and FutureUniverse types, the exchange and data time zones are set to the same value (exchange tz).
+            // This is not actual options/futures data, just chains/universe selection, so we don't want any offsets
+            // between the exchange and data time zones.
+            // If the MHDB were data type dependent as well, this would be taken care in there.
+            if (result != null && dataTypes.Any(dataType => dataType.IsAssignableTo(typeof(BaseChainUniverseData))))
+            {
+                result = new MarketHoursDatabase.Entry(result.ExchangeHours.TimeZone, result.ExchangeHours);
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -915,13 +926,10 @@ namespace QuantConnect
         public static string ToMD5(this string str)
         {
             var builder = new StringBuilder(32);
-            using (var md5Hash = MD5.Create())
+            var data = MD5.HashData(Encoding.UTF8.GetBytes(str));
+            for (var i = 0; i < 16; i++)
             {
-                var data = md5Hash.ComputeHash(Encoding.UTF8.GetBytes(str));
-                for (var i = 0; i < 16; i++)
-                {
-                    builder.Append(data[i].ToStringInvariant("x2"));
-                }
+                builder.Append(data[i].ToStringInvariant("x2"));
             }
             return builder.ToString();
         }
@@ -934,13 +942,10 @@ namespace QuantConnect
         public static string ToSHA256(this string data)
         {
             var hash = new StringBuilder(64);
-            using (var crypt = SHA256.Create())
+            var crypto = SHA256.HashData(Encoding.UTF8.GetBytes(data));
+            for (var i = 0; i < 32; i++)
             {
-                var crypto = crypt.ComputeHash(Encoding.UTF8.GetBytes(data));
-                for (var i = 0; i < 32; i++)
-                {
-                    hash.Append(crypto[i].ToStringInvariant("x2"));
-                }
+                hash.Append(crypto[i].ToStringInvariant("x2"));
             }
             return hash.ToString();
         }
@@ -1302,6 +1307,31 @@ namespace QuantConnect
 
             // this is good for forex and other small numbers
             return input.RoundToSignificantDigits(7).Normalize();
+        }
+
+        /// <summary>
+        /// Provides global smart rounding to a shorter version
+        /// </summary>
+        public static decimal SmartRoundingShort(this decimal input)
+        {
+            input = Normalize(input);
+            if (input <= 1)
+            {
+                // 0.99 > input
+                return input;
+            }
+            else if (input <= 10)
+            {
+                // 1.01 to 9.99
+                return Math.Round(input, 2);
+            }
+            else if (input <= 100)
+            {
+                // 99.9 to 10.1
+                return Math.Round(input, 1);
+            }
+            // 100 to inf
+            return Math.Truncate(input);
         }
 
         /// <summary>
@@ -3315,6 +3345,34 @@ namespace QuantConnect
         /// <returns>The result of the task</returns>
         public static T SynchronouslyAwaitTask<T>(this Task<T> task)
         {
+            return SynchronouslyAwaitTaskResult(task);
+        }
+
+        /// <summary>
+        /// Safely blocks until the specified task has completed executing
+        /// </summary>
+        /// <param name="task">The task to be awaited</param>
+        /// <returns>The result of the task</returns>
+        public static void SynchronouslyAwaitTask(this ValueTask task)
+        {
+            if (task.IsCompleted)
+            {
+                return;
+            }
+            task.ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Safely blocks until the specified task has completed executing
+        /// </summary>
+        /// <param name="task">The task to be awaited</param>
+        /// <returns>The result of the task</returns>
+        public static T SynchronouslyAwaitTask<T>(this ValueTask<T> task)
+        {
+            if (task.IsCompleted)
+            {
+                return task.Result;
+            }
             return task.ConfigureAwait(false).GetAwaiter().GetResult();
         }
 
@@ -3729,6 +3787,27 @@ namespace QuantConnect
         }
 
         /// <summary>
+        /// Helper method to determine the right data mapping mode to use by default
+        /// </summary>
+        public static DataMappingMode GetUniverseNormalizationModeOrDefault(this UniverseSettings universeSettings, SecurityType securityType, string market)
+        {
+            switch (securityType)
+            {
+                case SecurityType.Future:
+                    if ((universeSettings.DataMappingMode == DataMappingMode.OpenInterest
+                        || universeSettings.DataMappingMode == DataMappingMode.OpenInterestAnnual)
+                        && (market == Market.HKFE || market == Market.EUREX || market == Market.ICE))
+                    {
+                        // circle around default OI for currently no OI available data
+                        return DataMappingMode.LastTradingDay;
+                    }
+                    return universeSettings.DataMappingMode;
+                default:
+                    return universeSettings.DataMappingMode;
+            }
+        }
+
+        /// <summary>
         /// Helper method to determine the right data normalization mode to use by default
         /// </summary>
         public static DataNormalizationMode GetUniverseNormalizationModeOrDefault(this UniverseSettings universeSettings, SecurityType securityType)
@@ -3813,10 +3892,15 @@ namespace QuantConnect
         {
             foreach (var security in securityChanges.AddedSecurities)
             {
-                security.IsTradable = true;
-
                 // uses TryAdd, so don't need to worry about duplicates here
                 algorithm.Securities.Add(security);
+
+                if (security.Type == SecurityType.Index && !(security as Securities.Index.Index).ManualSetIsTradable)
+                {
+                    continue;
+                }
+
+                security.IsTradable = true;
             }
 
             var activeSecurities = algorithm.UniverseManager.ActiveSecurities;
@@ -4103,7 +4187,7 @@ namespace QuantConnect
             var expectedType = type.IsAssignableTo(config.Type);
 
             // Check our config type first to be lazy about using data.GetType() unless required
-            var configTypeFilter = (config.Type == typeof(TradeBar) || config.Type == typeof(ZipEntryName) ||
+            var configTypeFilter = (config.Type == typeof(TradeBar) || config.Type.IsAssignableTo(typeof(BaseChainUniverseData)) ||
                 config.Type == typeof(Tick) && config.TickType == TickType.Trade || config.IsCustomData);
 
             if (!configTypeFilter)
@@ -4122,7 +4206,12 @@ namespace QuantConnect
                 return (data as Delisting)?.Type == DelistingType.Delisted;
             }
 
-            if (!(type == typeof(Delisting) || type == typeof(Split) || type == typeof(Dividend)))
+            // We let delistings through. We need to emit delistings for all subscriptions, even internals like
+            // continuous futures mapped contracts. For instance, an algorithm might hold a position for a mapped
+            // contract and then the continuous future is mapped to a different contract. If the previously mapped
+            // contract is delisted, we need to let the delisting through so that positions are closed out and the
+            // security is removed from the algorithm and marked as delisted and non-tradable.
+            if (!(type == typeof(Split) || type == typeof(Dividend)))
             {
                 return true;
             }
@@ -4360,9 +4449,14 @@ namespace QuantConnect
             }
         }
 
+        /// <summary>
+        /// Retrieve a common custom data types from the given symbols if any
+        /// </summary>
+        /// <param name="symbols">The target symbols to search</param>
+        /// <returns>The custom data type or null</returns>
         public static Type GetCustomDataTypeFromSymbols(Symbol[] symbols)
         {
-            if (symbols.Any())
+            if (symbols.Length != 0)
             {
                 if (!SecurityIdentifier.TryGetCustomDataTypeInstance(symbols[0].ID.Symbol, out var dataType)
                     || symbols.Any(x => !SecurityIdentifier.TryGetCustomDataTypeInstance(x.ID.Symbol, out var customDataType) || customDataType != dataType))

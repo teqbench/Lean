@@ -203,8 +203,14 @@ namespace QuantConnect.Lean.Engine
                 // and fire them with the correct date/time.
                 realtime.ScanPastEvents(time);
 
-                // will scan registered consolidators for which we've past the expected scan call
-                algorithm.SubscriptionManager.ScanPastConsolidators(time, algorithm);
+                // will scan registered consolidators for which we've past the expected scan call.
+                // In live mode we want to round down to the second, so we don't scan too far into the future:
+                // The time slice might carry the data needed to complete a current consolidated bar but the
+                // time slice time might be slightly ahead (a few milliseconds or even ticks) because in live we
+                // use DateTime.UtcNow. So we don't want to scan past the data time so that the consolidators can
+                // complete the current bar.
+                var pastConsolidatorsScanTime = _liveMode ? time.RoundDown(Time.OneSecond) : time;
+                algorithm.SubscriptionManager.ScanPastConsolidators(pastConsolidatorsScanTime, algorithm);
 
                 //Set the algorithm and real time handler's time
                 algorithm.SetDateTime(time);
@@ -217,28 +223,6 @@ namespace QuantConnect.Lean.Engine
 
                 // Update the current slice before firing scheduled events or any other task
                 algorithm.SetCurrentSlice(timeSlice.Slice);
-
-                if (timeSlice.Slice.SymbolChangedEvents.Count != 0)
-                {
-                    try
-                    {
-                        algorithm.OnSymbolChangedEvents(timeSlice.Slice.SymbolChangedEvents);
-                    }
-                    catch (Exception err)
-                    {
-                        algorithm.SetRuntimeError(err, "OnSymbolChangedEvents");
-                        return;
-                    }
-
-                    foreach (var symbol in timeSlice.Slice.SymbolChangedEvents.Keys)
-                    {
-                        // cancel all orders for the old symbol
-                        foreach (var ticket in transactions.GetOpenOrderTickets(x => x.Symbol == symbol))
-                        {
-                            ticket.Cancel("Open order cancelled on symbol changed event");
-                        }
-                    }
-                }
 
                 if (timeSlice.SecurityChanges != SecurityChanges.None)
                 {
@@ -298,6 +282,28 @@ namespace QuantConnect.Lean.Engine
 
                 // security prices got updated
                 algorithm.Portfolio.InvalidateTotalPortfolioValue();
+
+                if (timeSlice.Slice.SymbolChangedEvents.Count != 0)
+                {
+                    try
+                    {
+                        algorithm.OnSymbolChangedEvents(timeSlice.Slice.SymbolChangedEvents);
+                    }
+                    catch (Exception err)
+                    {
+                        algorithm.SetRuntimeError(err, "OnSymbolChangedEvents");
+                        return;
+                    }
+
+                    foreach (var symbol in timeSlice.Slice.SymbolChangedEvents.Keys)
+                    {
+                        // cancel all orders for the old symbol
+                        foreach (var ticket in transactions.GetOpenOrderTickets(x => x.Symbol == symbol))
+                        {
+                            ticket.Cancel("Open order cancelled on symbol changed event");
+                        }
+                    }
+                }
 
                 // process fill models on the updated data before entering algorithm, applies to all non-market orders
                 transactions.ProcessSynchronousEvents();
