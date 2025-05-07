@@ -20,6 +20,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using QuantConnect.AlgorithmFactory.Python.Wrappers;
 using QuantConnect.Brokerages;
 using QuantConnect.Configuration;
 using QuantConnect.Data;
@@ -297,32 +298,32 @@ namespace QuantConnect.Lean.Engine
 
                     //Load the associated handlers for transaction and realtime events:
                     AlgorithmHandlers.Transactions.Initialize(algorithm, brokerage, AlgorithmHandlers.Results);
-                    AlgorithmHandlers.RealTime.Setup(algorithm, job, AlgorithmHandlers.Results, SystemHandlers.Api, algorithmManager.TimeLimit);
-
-                    // wire up the brokerage message handler
-                    brokerage.Message += (sender, message) =>
-                    {
-                        algorithm.BrokerageMessageHandler.HandleMessage(message);
-
-                        // fire brokerage message events
-                        algorithm.OnBrokerageMessage(message);
-                        switch (message.Type)
-                        {
-                            case BrokerageMessageType.Disconnect:
-                                algorithm.OnBrokerageDisconnect();
-                                break;
-                            case BrokerageMessageType.Reconnect:
-                                algorithm.OnBrokerageReconnect();
-                                break;
-                        }
-                    };
-
-                    // Result manager scanning message queue: (started earlier)
-                    AlgorithmHandlers.Results.DebugMessage(
-                        $"Launching analysis for {job.AlgorithmId} with LEAN Engine v{Globals.Version}");
-
                     try
                     {
+                        AlgorithmHandlers.RealTime.Setup(algorithm, job, AlgorithmHandlers.Results, SystemHandlers.Api, algorithmManager.TimeLimit);
+
+                        // wire up the brokerage message handler
+                        brokerage.Message += (sender, message) =>
+                        {
+                            algorithm.BrokerageMessageHandler.HandleMessage(message);
+
+                            // fire brokerage message events
+                            algorithm.OnBrokerageMessage(message);
+                            switch (message.Type)
+                            {
+                                case BrokerageMessageType.Disconnect:
+                                    algorithm.OnBrokerageDisconnect();
+                                    break;
+                                case BrokerageMessageType.Reconnect:
+                                    algorithm.OnBrokerageReconnect();
+                                    break;
+                            }
+                        };
+
+                        // Result manager scanning message queue: (started earlier)
+                        AlgorithmHandlers.Results.DebugMessage(
+                            $"Launching analysis for {job.AlgorithmId} with LEAN Engine v{Globals.Version}");
+
                         //Create a new engine isolator class
                         var isolator = new Isolator();
 
@@ -450,6 +451,7 @@ namespace QuantConnect.Lean.Engine
                 AlgorithmHandlers.Transactions.Exit();
                 AlgorithmHandlers.RealTime.Exit();
                 AlgorithmHandlers.DataMonitor.Exit();
+                (algorithm as AlgorithmPythonWrapper)?.DisposeSafely();
             }
         }
 
