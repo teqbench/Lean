@@ -90,6 +90,12 @@ namespace QuantConnect.Algorithm.CSharp
                             }
                         }
                     }
+
+                    // We should be able to access the open interest of the contract
+                    if (chain.Value.All(contract => contract.OpenInterest == 0))
+                    {
+                        throw new RegressionTestException("Regression test failed: open interest is zero for all contracts");
+                    }
                 }
             }
         }
@@ -160,6 +166,7 @@ namespace QuantConnect.Algorithm.CSharp
             {"Estimated Strategy Capacity", "$0"},
             {"Lowest Capacity Asset", "AOL W78ZERDZK1QE|AOL R735QTJ8XC9X"},
             {"Portfolio Turnover", "0.07%"},
+            {"Drawdown Recovery", "0"},
             {"OrderListHash", "58c3e82532109b692429e1eb062296b5"}
         };
     }

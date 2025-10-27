@@ -18,9 +18,24 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using Python.Runtime;
 
 namespace QuantConnect.Indicators
 {
+    /// <summary>
+    /// This is generic rolling window.
+    /// </summary>
+    public class RollingWindow : RollingWindow<object>
+    {
+        /// <summary>
+        /// Initializes a new RollingWindow with the specified size.
+        /// </summary>
+        /// <param name="size">The number of elements to store in the window</param>
+        public RollingWindow(int size) : base(size)
+        {
+        }
+    }
+
     /// <summary>
     ///     This is a window that allows for list access semantics,
     ///     where this[0] refers to the most recent item in the
@@ -48,9 +63,9 @@ namespace QuantConnect.Indicators
         /// <param name="size">The number of items to hold in the window</param>
         public RollingWindow(int size)
         {
-            if (size < 1)
+            if (size < 0)
             {
-                throw new ArgumentException(Messages.RollingWindow.InvalidSize, nameof(size));
+                throw new ArgumentException(Messages.RollingWindow.InvalidSize(0), nameof(size));
             }
             _list = new List<T>(size);
             _size = size;
@@ -59,7 +74,7 @@ namespace QuantConnect.Indicators
         /// <summary>
         ///     Gets the size of this window
         /// </summary>
-        public int Size
+        public virtual int Size
         {
             get
             {
@@ -150,7 +165,7 @@ namespace QuantConnect.Indicators
         /// </summary>
         /// <param name="i">the index, i</param>
         /// <returns>the ith most recent entry</returns>
-        public T this [int i]
+        public T this[int i]
         {
             get
             {
@@ -160,7 +175,16 @@ namespace QuantConnect.Indicators
 
                     if (i < 0)
                     {
-                        throw new ArgumentOutOfRangeException(nameof(i), i, Messages.RollingWindow.IndexOutOfSizeRange);
+                        if (_size + i < 0)
+                        {
+                            throw new ArgumentOutOfRangeException(nameof(i), i, Messages.RollingWindow.IndexOutOfSizeRange);
+                        }
+                        i = _list.Count + i;
+
+                        if (i < 0)
+                        {
+                            return default;
+                        }
                     }
 
                     if (i > _list.Count - 1)
@@ -190,7 +214,11 @@ namespace QuantConnect.Indicators
 
                     if (i < 0)
                     {
-                        throw new ArgumentOutOfRangeException(nameof(i), i, Messages.RollingWindow.IndexOutOfSizeRange);
+                        if (_size + i < 0)
+                        {
+                            throw new ArgumentOutOfRangeException(nameof(i), i, Messages.RollingWindow.IndexOutOfSizeRange);
+                        }
+                        i = _size + i;
                     }
 
                     if (i > _list.Count - 1)
@@ -258,7 +286,7 @@ namespace QuantConnect.Indicators
                     temp[i] = _list[GetListIndex(i, count, _tail)];
                 }
 
-                return ((IEnumerable<T>) temp).GetEnumerator();
+                return ((IEnumerable<T>)temp).GetEnumerator();
             }
             finally
             {
@@ -312,7 +340,7 @@ namespace QuantConnect.Indicators
         /// <summary>
         ///     Clears this window of all data
         /// </summary>
-        public void Reset()
+        public virtual void Reset()
         {
             try
             {
