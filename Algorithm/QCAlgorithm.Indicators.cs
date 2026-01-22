@@ -53,7 +53,8 @@ namespace QuantConnect.Algorithm
             "IsReady",
             "Window",
             "Item",
-            "WarmUpPeriod"
+            "WarmUpPeriod",
+            "Period"
         };
 
         /// <summary>
@@ -487,6 +488,26 @@ namespace QuantConnect.Algorithm
             InitializeIndicator(correlation, resolution, selector, target, reference);
 
             return correlation;
+        }
+
+        /// <summary>
+        /// Creates a Covariance indicator for the given target symbol in relation with the reference used.
+        /// The indicator will be automatically updated on the given resolution.
+        /// </summary>
+        /// <param name="target">The target symbol whose Covariance value we want</param>
+        /// <param name="reference">The reference symbol to compare with the target symbol</param>
+        /// <param name="period">The period of the Covariance indicator</param>
+        /// <param name="resolution">The resolution</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to casting the input value to a TradeBar</param>
+        /// <returns>The Covariance indicator for the given parameters</returns>
+        [DocumentationAttribute(Indicators)]
+        public Covariance COV(Symbol target, Symbol reference, int period, Resolution? resolution = null, Func<IBaseData, IBaseDataBar> selector = null)
+        {
+            var name = CreateIndicatorName(QuantConnect.Symbol.None, $"COV({period})", resolution);
+            var covariance = new Covariance(name, target, reference, period);
+            InitializeIndicator(covariance, resolution, selector, target, reference);
+
+            return covariance;
         }
 
         /// <summary>
@@ -1435,7 +1456,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(Indicators)]
         public VolumeProfile VP(Symbol symbol, int period = 2, decimal valueAreaVolumePercentage = 0.70m, decimal priceRangeRoundOff = 0.05m, Resolution resolution = Resolution.Daily, Func<IBaseData, TradeBar> selector = null)
         {
-            var name = CreateIndicatorName(symbol, $"VP({period})", resolution);
+            var name = CreateIndicatorName(symbol, $"VP({period},{valueAreaVolumePercentage},{priceRangeRoundOff})", resolution);
             var marketProfile = new VolumeProfile(name, period, valueAreaVolumePercentage, priceRangeRoundOff);
             InitializeIndicator(marketProfile, resolution, selector, symbol);
 
@@ -1456,7 +1477,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(Indicators)]
         public TimeProfile TP(Symbol symbol, int period = 2, decimal valueAreaVolumePercentage = 0.70m, decimal priceRangeRoundOff = 0.05m, Resolution resolution = Resolution.Daily, Func<IBaseData, TradeBar> selector = null)
         {
-            var name = CreateIndicatorName(symbol, $"TP({period})", resolution);
+            var name = CreateIndicatorName(symbol, $"TP({period},{valueAreaVolumePercentage},{priceRangeRoundOff})", resolution);
             var marketProfile = new TimeProfile(name, period, valueAreaVolumePercentage, priceRangeRoundOff);
             InitializeIndicator(marketProfile, resolution, selector, symbol);
 
@@ -1689,6 +1710,50 @@ namespace QuantConnect.Algorithm
             InitializeIndicator(normalizedAverageTrueRange, resolution, selector, symbol);
 
             return normalizedAverageTrueRange;
+        }
+
+        /// <summary>
+        /// Creates a new New Highs - New Lows indicator
+        /// </summary>
+        /// <param name="symbols">The symbols whose NHNL we want</param>
+        /// <param name="period">The period over which to compute the NHNL</param>
+        /// <param name="resolution">The resolution</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to casting the input value to a IBaseDataBar</param>
+        /// <returns>The NewHighsNewLows indicator for the requested symbols over the specified period</returns>
+        [DocumentationAttribute(Indicators)]
+        public NewHighsNewLows NHNL(IEnumerable<Symbol> symbols, int period, Resolution? resolution = null, Func<IBaseData, IBaseDataBar> selector = null)
+        {
+            var name = CreateIndicatorName(QuantConnect.Symbol.None, $"NH/NL({period})", resolution ?? GetSubscription(symbols.First()).Resolution);
+            var nhnlDifference = new NewHighsNewLows(name, period);
+            foreach (var symbol in symbols)
+            {
+                nhnlDifference.Add(symbol);
+            }
+            InitializeIndicator(nhnlDifference, resolution, selector, symbols.ToArray());
+
+            return nhnlDifference;
+        }
+
+        /// <summary>
+        /// Creates a new New Highs - New Lows Volume indicator
+        /// </summary>
+        /// <param name="symbols">The symbols whose NHNLV we want</param>
+        /// <param name="period">The period over which to compute the NHNLV</param>
+        /// <param name="resolution">The resolution</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to casting the input value to a TradeBar</param>
+        /// <returns>The NewHighsNewLowsVolume indicator for the requested symbols over the specified period</returns>
+        [DocumentationAttribute(Indicators)]
+        public NewHighsNewLowsVolume NHNLV(IEnumerable<Symbol> symbols, int period, Resolution? resolution = null, Func<IBaseData, TradeBar> selector = null)
+        {
+            var name = CreateIndicatorName(QuantConnect.Symbol.None, $"NH/NL Volume({period})", resolution ?? GetSubscription(symbols.First()).Resolution);
+            var nhnlVolume = new NewHighsNewLowsVolume(name, period);
+            foreach (var symbol in symbols)
+            {
+                nhnlVolume.Add(symbol);
+            }
+            InitializeIndicator(nhnlVolume, resolution, selector, symbols.ToArray());
+
+            return nhnlVolume;
         }
 
         /// <summary>
@@ -2215,7 +2280,7 @@ namespace QuantConnect.Algorithm
 
             return targetDownsideDeviation;
         }
-        
+
         /// <summary>
         /// Creates a new TomDemark Sequential candlestick indicator for the symbol. The indicator will be automatically
         /// updated on the symbol's subscription resolution.

@@ -522,6 +522,7 @@ def getTickHistory(algorithm, symbol, start, end):
         public void TimeSpanHistoryRequestIsCorrectlyBuilt(Resolution resolution, Language language, bool symbolAlreadyAdded)
         {
             _algorithm.SetStartDate(2013, 10, 07);
+            _algorithm.Settings.SeedInitialPrices = false;
 
             var symbol = Symbols.SPY;
             if (symbolAlreadyAdded)
@@ -618,6 +619,7 @@ def getTickHistory(algorithm, symbol, start, end):
             bool symbolAlreadyAdded, DateTime dateTime, Resolution? defaultResolution, bool multiSymbol)
         {
             _algorithm.SetStartDate(dateTime);
+            _algorithm.Settings.SeedInitialPrices = false;
 
             if (symbolAlreadyAdded)
             {
@@ -695,6 +697,7 @@ def getTickHistory(algorithm, symbol, start, end):
         public void TickHistoryRequestIgnoresFillForward(Language language, bool symbolAlreadyAdded)
         {
             _algorithm.SetStartDate(2013, 10, 07);
+            _algorithm.Settings.SeedInitialPrices = false;
 
             var symbol = Symbols.SPY;
             if (symbolAlreadyAdded)
@@ -895,9 +898,10 @@ class Test(PythonData):
             var option = algorithm.AddOptionContract(Symbols.CreateOptionSymbol("AAPL", OptionRight.Call, 250m, new DateTime(2016, 01, 15)));
 
             var lastKnownPrices = algorithm.GetLastKnownPrices(option).ToList();
-            Assert.AreEqual(2, lastKnownPrices.Count);
+            Assert.AreEqual(3, lastKnownPrices.Count);
             Assert.AreEqual(1, lastKnownPrices.Count(data => data.GetType() == typeof(TradeBar)));
             Assert.AreEqual(1, lastKnownPrices.Count(data => data.GetType() == typeof(QuoteBar)));
+            Assert.AreEqual(1, lastKnownPrices.Count(data => data.GetType() == typeof(OpenInterest)));
         }
 
         [Test]
@@ -919,9 +923,10 @@ class Test(PythonData):
             var future = algorithm.AddSecurity(Symbols.CreateFutureSymbol(Futures.Indices.SP500EMini, new DateTime(2013, 12, 20)));
 
             var lastKnownPrices = algorithm.GetLastKnownPrices(future).ToList();
-            Assert.AreEqual(2, lastKnownPrices.Count);
+            Assert.AreEqual(3, lastKnownPrices.Count);
             Assert.AreEqual(1, lastKnownPrices.Count(data => data.GetType() == typeof(TradeBar)));
             Assert.AreEqual(1, lastKnownPrices.Count(data => data.GetType() == typeof(QuoteBar)));
+            Assert.AreEqual(1, lastKnownPrices.Count(data => data.GetType() == typeof(OpenInterest)));
         }
 
         [TestCase(Language.CSharp)]
@@ -3960,6 +3965,89 @@ def get_history(algorithm, symbol):
                     Assert.AreNotEqual(DayOfWeek.Saturday, data.Time.DayOfWeek);
                     Assert.AreNotEqual(DayOfWeek.Sunday, data.Time.DayOfWeek);
                 }
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void HistoryRequestUsesSecurityConfigOrExplicitValues(bool explicitParameters)
+        {
+            var start = new DateTime(2013, 10, 28);
+            var algorithm = GetAlgorithm(start);
+            var future = algorithm.AddFuture(
+                Futures.Indices.SP500EMini, 
+                dataNormalizationMode: DataNormalizationMode.BackwardsRatio, 
+                dataMappingMode: DataMappingMode.LastTradingDay, 
+                contractDepthOffset: 0,
+                extendedMarketHours: true);
+
+            var customTestHistoryProvider = new CustomTestHistoryProvider();
+            algorithm.SetHistoryProvider(customTestHistoryProvider);
+            algorithm.HistoryProvider.Initialize(new HistoryProviderInitializeParameters(
+                null,
+                null,
+                _dataProvider,
+                _cacheProvider,
+                _mapFileProvider,
+                _factorFileProvider,
+                null,
+                false,
+                new DataPermissionManager(),
+                algorithm.ObjectStore,
+                algorithm.Settings));
+
+            List<SymbolChangedEvent> history;
+
+            if (!explicitParameters)
+            {
+                history = algorithm.History<SymbolChangedEvent>(
+                    future.Symbol,
+                    new DateTime(2007, 1, 1),
+                    new DateTime(2012, 1, 1)).ToList();
+            }
+            else
+            {
+                history = algorithm.History<SymbolChangedEvent>(
+                    future.Symbol,
+                    new DateTime(2007, 1, 1),
+                    new DateTime(2012, 1, 1),
+                    dataNormalizationMode: DataNormalizationMode.Raw,
+                    dataMappingMode: DataMappingMode.OpenInterest,
+                    contractDepthOffset: 0,
+                    extendedMarketHours: false).ToList();
+            }
+
+            Assert.AreEqual(1, customTestHistoryProvider.HistoryRequests.Count);
+            Assert.Greater(history.Count, 0);
+
+            var request = customTestHistoryProvider.HistoryRequests[0];
+
+            if (!explicitParameters)
+            {
+                // Without explicit parameters: uses values from security configuration
+                Assert.AreEqual(DataNormalizationMode.BackwardsRatio, request.DataNormalizationMode);
+                Assert.AreEqual(DataMappingMode.LastTradingDay, request.DataMappingMode);
+                Assert.AreEqual(true, request.IncludeExtendedMarketHours);
+                Assert.AreEqual(0, request.ContractDepthOffset);
+            }
+            else
+            {
+                // With explicit parameters: uses values from history request
+                Assert.AreEqual(DataNormalizationMode.Raw, request.DataNormalizationMode);
+                Assert.AreEqual(DataMappingMode.OpenInterest, request.DataMappingMode);
+                Assert.AreEqual(false, request.IncludeExtendedMarketHours);
+                Assert.AreEqual(0, request.ContractDepthOffset);
+            }
+        }
+
+        private class CustomTestHistoryProvider : SubscriptionDataReaderHistoryProvider
+        {
+            public List<HistoryRequest> HistoryRequests { get; } = new List<HistoryRequest>();
+
+            public override IEnumerable<Slice> GetHistory(IEnumerable<HistoryRequest> requests, DateTimeZone sliceTimeZone)
+            {
+                HistoryRequests.AddRange(requests);
+                return base.GetHistory(requests, sliceTimeZone);
             }
         }
 

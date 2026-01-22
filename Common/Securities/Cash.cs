@@ -262,6 +262,14 @@ namespace QuantConnect.Securities
             var cfdEntries = GetAvailableSymbolPropertiesDatabaseEntries(SecurityType.Cfd, marketMap, markets);
             var cryptoEntries = GetAvailableSymbolPropertiesDatabaseEntries(SecurityType.Crypto, marketMap, markets);
 
+            if (marketMap.TryGetValue(SecurityType.CryptoFuture, out var cryptoFutureMarket) && cryptoFutureMarket == Market.DYDX)
+            {
+                // Put additional logic for dYdX crypto futures as they don't have Crypto (Spot) market
+                // Also need to add them first to give the priority
+                // TODO: remove once dydx SPOT market will be imlemented
+                cryptoEntries = GetAvailableSymbolPropertiesDatabaseEntries(SecurityType.CryptoFuture, marketMap, markets).Concat(cryptoEntries);
+            }
+
             var potentialEntries = forexEntries
                 .Concat(cfdEntries)
                 .Concat(cryptoEntries)
@@ -316,7 +324,9 @@ namespace QuantConnect.Securities
 
                 var newSecurity = securityService.CreateSecurity(symbol,
                     config,
-                    addToSymbolCache: false);
+                    addToSymbolCache: false,
+                    // All securities added for currency conversion will be seeded in batch after all are created
+                    seedSecurity: false);
 
                 Log.Trace("Cash.EnsureCurrencyDataFeed(): " + Messages.Cash.AddingSecuritySymbolForCashCurrencyFeed(symbol, Symbol));
 
